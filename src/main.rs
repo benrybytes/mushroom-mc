@@ -1,7 +1,8 @@
-use log::*;
-
+use log::{error, info, warn};
 mod byte_handlers;
+mod globals;
 mod handlers;
+mod packet;
 mod varnums;
 
 use handlers::handle_client;
@@ -17,11 +18,9 @@ async fn main() -> Result<(), io::Error> {
         match listener.accept().await {
             Ok((mut socket, _)) => {
                 info! {"{:?}", socket};
-                if let Err(e) = handle_client(&mut socket).await {
-                    info! {"error: {:?}", e};
-                }
+                tokio::spawn(async move { handle_client(&mut socket).await });
             }
-            Err(e) => info!("couldn't get client: {:?}", e),
+            Err(e) => warn!("couldn't get client: {:?}", e),
         }
     }
 }
