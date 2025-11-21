@@ -1,12 +1,19 @@
-use crate::{
-    byte_handlers::{ByteHandler, RECV_TYPE},
-    globals::*,
-    handlers::PLAYER_STATES,
-    varnums::VARNUM_ERROR,
-};
 use log::*;
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
 use std::os::fd::{AsRawFd, RawFd};
+use std::rc::Rc;
 use tokio::net::TcpStream;
+
+pub mod byte_handlers;
+pub mod varnums;
+use crate::globals::*;
+use crate::handlers::PLAYER_STATES;
+
+use crate::packets::varnums::VARNUM_ERROR;
+use byte_handlers::RECV_TYPE;
+
+static DEFAULT_SIZE: usize = 1024;
 
 #[derive(PartialEq, Eq)]
 pub enum RECV {
@@ -15,21 +22,30 @@ pub enum RECV {
 }
 
 pub struct PacketHandler<'a> {
-    pub buffer_handler_: &'a mut ByteHandler<'a>,
+    recv_buffer: [u8; DEFAULT_SIZE],
+    pub recv_count: usize,
+    pub client_fd: &'a mut TcpStream,
+    client_state: i32,
+    pub processed_bytes: usize,
     pub length: usize,
 }
 
 impl<'a> PacketHandler<'a> {
-    pub fn new(buffer_handler_: &'a mut ByteHandler<'a>, length: usize) -> Self {
+    pub fn new(client_fd: &'a mut TcpStream) -> Self {
         PacketHandler {
-            buffer_handler_,
-            length,
+            client_fd,
+            client_state: 0,
+            length: 0,
+            recv_buffer: [0_u8; DEFAULT_SIZE],
+            recv_count: 0,
+            processed_bytes: 0,
         }
     }
-    pub async fn handshake(&mut self, state: i32) {
-        info! {"state received {}", state};
+    pub async fn handshake(&mut self) {
+        let state = self.client_state;
+        debug! {"state received {}", state};
         if state == STATE_NONE {
-            info! {"in state none"};
+            debug! {"in state none"};
             if self.cs_handshake().await == RECV::ERROR {
                 warn! {"cs_handshake unsuccessful"};
                 return;
@@ -59,61 +75,70 @@ impl<'a> PacketHandler<'a> {
             //         return;
             //     }
         }
-        info! {"state {}", state};
+        debug! {"state {}", state};
     }
 
-    pub async fn pong(&mut self) {
-        self.buffer_handler_.write_byte(9).await;
-        self.buffer_handler_.write_byte(0x01).await;
-        let u64_value = self.buffer_handler_.read_uint64().await.to_be_bytes();
-        self.buffer_handler_.write_n_bytes(&u64_value, 8).await;
+    pub async fn ping(&mut self) {
+        let state = self.client_state;
+        if state == STATE_STATUS {
+            // No need for a packet handler, just echo back the long verbatim
+            self.write_byte(9).await;
+            self.write_byte(0x01).await;
+            let read_value = self.read_uint64().await;
+            self.write_n_bytes(&read_value.to_le_bytes(), 8).await;
+            self.recv_count = 0;
+            debug! {"read_value {}", read_value};
+        }
     }
+
     async fn cs_handshake(&mut self) -> RECV {
-        info! {"inside cs_handshake"};
-        let protocol = self.buffer_handler_.read_varint().await;
-        let address = self.buffer_handler_.read_string().await;
-        info! {"address: {}", address};
-        info! {"protocol: {}", protocol};
+        let protocol = self.read_varint().await;
+        let address = self.read_string().await;
+        debug! {"address: {}", address};
+        debug! {"protocol: {}", protocol};
 
-        if self.buffer_handler_.recv_count == 0 {
+        if self.recv_count == 0 {
             warn! {"recv_count is zero in cs_handshake"};
             return RECV::ERROR;
         }
-        info! {"about to get port"};
-        let port = self.buffer_handler_.read_uint16().await;
-        info! {"port: {}", port};
-        let intent = self.buffer_handler_.read_varint().await;
-        info! {"intent: {}", intent};
+        let port = self.read_uint16().await;
+        debug! {"port: {}", port};
+        let intent = self.read_varint().await;
+        debug! {"intent: {}", intent};
         if intent == VARNUM_ERROR {
+            warn! {"intent not found"};
             return RECV::ERROR;
         }
-        let mut client_states_ = PLAYER_STATES.lock().await;
-        client_states_.insert(self.buffer_handler_.client_fd.as_raw_fd(), intent);
-        info! {"client state: {}", client_states_.get(&self.buffer_handler_.client_fd.as_raw_fd()).unwrap()};
+        debug! {"before client states"};
+        let mut client_states_ = PLAYER_STATES.write().await;
+        client_states_.insert(self.client_fd.as_raw_fd(), intent);
+        self.client_state = intent;
+
+        debug! {"{:?}", client_states_};
+        debug! {"client state: {}", client_states_.get(&self.client_fd.as_raw_fd()).unwrap()};
         RECV::SUCCESS
     }
 
     async fn sc_statusResponse(&mut self) -> RECV {
         let header = r###"
     {
-        "version":{"name":"1.21.8","protocol":772},
+        "version":{"name":"1.21.8","protocol":773},
         "description":{"text":""
     "###;
         let footer = r###"
         "}}
     "###;
-        let motd = "blahaj's den";
+        let motd = "blahaj's adventure";
         let string_len = (header.len() + footer.len() + motd.len() - 2) as i32;
 
-        self.buffer_handler_
-            .write_varint(1 + string_len + self.buffer_handler_.size_varint(string_len))
+        self.write_varint(1 + string_len + self.size_varint(string_len))
             .await;
-        self.buffer_handler_.write_byte(0x00).await;
+        self.write_byte(0x00).await;
 
-        self.buffer_handler_.write_varint(string_len).await;
-        self.buffer_handler_.write_all(header.as_bytes()).await;
-        self.buffer_handler_.write_all(motd.as_bytes()).await;
-        self.buffer_handler_.write_all(footer.as_bytes()).await;
+        self.write_varint(string_len).await;
+        self.write_all(header.as_bytes()).await;
+        self.write_all(motd.as_bytes()).await;
+        self.write_all(footer.as_bytes()).await;
 
         RECV::SUCCESS
     }
@@ -121,22 +146,22 @@ impl<'a> PacketHandler<'a> {
     // C->S Login Start
     async fn cs_loginStart(&mut self) -> (RECV, Vec<u8>, String) {
         info! {"Received Login Start:\n"};
-        self.buffer_handler_.read_string().await;
+        self.read_string().await;
         let mut name: String = String::with_capacity(16);
         let mut uuid = vec![];
-        &self.buffer_handler_.recv_buffer[..16].clone_into(&mut uuid);
-        if self.buffer_handler_.recv_count == 0 {
+        &self.recv_buffer[..16].clone_into(&mut uuid);
+        if self.recv_count == 0 {
             return (RECV::ERROR, vec![], String::new());
         }
-        if let Ok(name_from_buffer) = String::from_utf8(self.buffer_handler_.recv_buffer.to_vec()) {
+        if let Ok(name_from_buffer) = String::from_utf8(self.recv_buffer.to_vec()) {
             name = name_from_buffer;
         } else {
             return (RECV::ERROR, vec![], String::new());
         }
         name.replace_range(15..16, "\0");
         info! {"  Player name: {}\n", name};
-        self.buffer_handler_.recv_n_bytes(16, RECV_TYPE::PEEK).await;
-        if self.buffer_handler_.recv_count == 0 {
+        self.recv_n_bytes(16, RECV_TYPE::PEEK).await;
+        if self.recv_count == 0 {
             return (RECV::ERROR, vec![], String::new());
         }
         info! {"Player UUID: "};
@@ -153,17 +178,15 @@ impl<'a> PacketHandler<'a> {
         info!("Sending Login Success...\n\n");
 
         let name_length: i32 = name.len() as i32;
-        self.buffer_handler_
-            .write_varint(1 + 16 + self.buffer_handler_.size_varint(name_length) + name_length + 1)
+        self.write_varint(1 + 16 + self.size_varint(name_length) + name_length + 1)
             .await;
-        self.buffer_handler_.write_varint(0x02).await;
-        let _ = self.buffer_handler_.write_n_bytes(uuid, 16).await;
-        self.buffer_handler_.write_varint(name_length).await;
+        self.write_varint(0x02).await;
+        let _ = self.write_n_bytes(uuid, 16).await;
+        self.write_varint(name_length).await;
         let _ = self
-            .buffer_handler_
             .write_n_bytes(name.as_bytes(), name_length as usize)
             .await;
-        self.buffer_handler_.write_varint(0).await;
+        self.write_varint(0).await;
 
         RECV::SUCCESS
     }

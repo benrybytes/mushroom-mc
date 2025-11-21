@@ -1,10 +1,7 @@
 use log::{error, info, warn};
-mod byte_handlers;
 mod globals;
 mod handlers;
-mod packet;
-mod varnums;
-
+mod packets;
 use handlers::handle_client;
 use tokio::io;
 

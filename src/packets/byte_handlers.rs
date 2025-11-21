@@ -1,39 +1,21 @@
 #![allow(static_mut_refs)]
 
+use super::PacketHandler;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use lazy_static::lazy_static;
 use log::*;
-use std::cell::RefCell;
 use std::io::{Cursor, Error, Write};
-use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio::{io, net::TcpStream};
 
+#[allow(non_camel_case_types)]
 #[derive(PartialEq, Eq)]
 pub enum RECV_TYPE {
     READ,
     PEEK,
 }
-static DEFAULT_SIZE: usize = 1024;
 
-pub struct ByteHandler<'a> {
-    pub recv_buffer: [u8; DEFAULT_SIZE],
-    pub recv_count: usize,
-    pub client_fd: &'a mut TcpStream,
-    pub processed_bytes: usize,
-}
-
-impl<'a> ByteHandler<'a> {
-    pub fn new(client_fd: &'a mut TcpStream) -> Self {
-        ByteHandler {
-            recv_buffer: [0_u8; DEFAULT_SIZE],
-            recv_count: 0,
-            client_fd,
-            processed_bytes: 0,
-        }
-    }
-
+impl<'a> PacketHandler<'a> {
     async fn recv_buffer_to_big_endian(&mut self) -> u64 {
         // in-memory self.recv_buffer to change
         info! {"recv count: {}", self.recv_count};
@@ -45,15 +27,12 @@ impl<'a> ByteHandler<'a> {
         let length = self.read_varint().await;
         self.recv_n_bytes(length as usize, RECV_TYPE::READ).await;
         self.recv_buffer[self.recv_count] = b'\0';
-        info! {"recv count in string: {}", self.recv_count};
-        info! {"recv buffer: {:?}", self.recv_buffer};
 
         String::from_utf8_lossy(&self.recv_buffer[..self.recv_count]).to_string()
     }
 
     pub async fn read_uint16(&mut self) -> u16 {
         self.recv_n_bytes(2, RECV_TYPE::READ).await;
-        info! {"utf16: {:?}", &self.recv_buffer[..2]};
         ((self.recv_buffer[0] as u16) << 8) | self.recv_buffer[1] as u16
     }
 
@@ -90,9 +69,8 @@ impl<'a> ByteHandler<'a> {
     }
 
     pub async fn read_byte(&mut self) -> io::Result<u8> {
-        self.recv_count = self.client_fd.read(&mut self.recv_buffer[..1]).await?; // Read exactly one byte
-        //
-        Ok(self.recv_buffer[0]) // Return the byte
+        self.recv_count = self.client_fd.read(&mut self.recv_buffer[..1]).await?;
+        Ok(self.recv_buffer[0])
     }
 
     pub async fn write_byte(&mut self, value: u8) -> io::Result<()> {

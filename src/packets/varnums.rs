@@ -2,11 +2,11 @@ static SEGMENT_BITS: i32 = 0x7F;
 static CONTINUE_BIT: i32 = 0x80;
 pub static VARNUM_ERROR: i32 = 0xFFFFFF;
 
-use crate::byte_handlers::ByteHandler;
+use super::PacketHandler;
 use log::*;
 use tokio::net::TcpStream;
 
-impl<'a> ByteHandler<'a> {
+impl<'a> PacketHandler<'a> {
     pub async fn read_varint(&mut self) -> i32 {
         let mut value: i32 = 0;
         let mut position: i32 = 0;
@@ -30,8 +30,6 @@ impl<'a> ByteHandler<'a> {
                 break;
             }
         }
-
-        info! {"value: {}", value};
         return value;
     }
 
@@ -55,7 +53,7 @@ impl<'a> ByteHandler<'a> {
                 .write_byte(((value & SEGMENT_BITS) | CONTINUE_BIT) as u8)
                 .await
             {
-                info! {"{:?}", e};
+                error! {"{:?}", e};
             }
 
             value >>= 7;
