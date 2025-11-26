@@ -16,13 +16,6 @@ pub enum RECV_TYPE {
 }
 
 impl<'a> PacketHandler<'a> {
-    async fn recv_buffer_to_big_endian(&mut self) -> u64 {
-        // in-memory self.recv_buffer to change
-        info! {"recv count: {}", self.recv_count};
-        let mut rdr = Cursor::new(&self.recv_buffer);
-        ReadBytesExt::read_u64::<BigEndian>(&mut rdr).unwrap()
-    }
-
     pub async fn read_string(&mut self) -> String {
         let length = self.read_varint().await;
         self.recv_n_bytes(length as usize, RECV_TYPE::READ).await;
@@ -38,6 +31,7 @@ impl<'a> PacketHandler<'a> {
 
     pub async fn read_uint64(&mut self) -> u16 {
         self.recv_n_bytes(8, RECV_TYPE::READ).await;
+        debug! {"{:?}", &self.recv_buffer[..10]};
         ((self.recv_buffer[0] as u16) << 56)
             | ((self.recv_buffer[1] as u16) << 48)
             | ((self.recv_buffer[2] as u16) << 40)
@@ -56,6 +50,7 @@ impl<'a> PacketHandler<'a> {
                     .read_exact(&mut self.recv_buffer[..n])
                     .await
                     .expect("could not read");
+                self.processed_bytes += self.recv_count;
             }
             RECV_TYPE::PEEK => {
                 self.recv_count = self
@@ -65,7 +60,6 @@ impl<'a> PacketHandler<'a> {
                     .expect("could not peek");
             }
         };
-        self.processed_bytes += self.recv_count;
     }
 
     pub async fn read_byte(&mut self) -> io::Result<u8> {
@@ -73,6 +67,19 @@ impl<'a> PacketHandler<'a> {
         Ok(self.recv_buffer[0])
     }
 
+    pub async fn write_utf8_string(&mut self, data: &[u8]) -> io::Result<()> {
+        // 1. Get the length of the UTF-8 bytes
+        let data_length = data.len() as i32;
+
+        // 2. Write the length as a VarInt (The ONLY length prefix needed for the string)
+        self.write_varint(data_length).await?;
+
+        // 3. Write the actual UTF-8 encoded string data
+        // Assuming self.write_all(data) is equivalent to writing all bytes in the slice.
+        self.write_all(data).await?;
+
+        Ok(())
+    }
     pub async fn write_byte(&mut self, value: u8) -> io::Result<()> {
         self.client_fd.write_u8(value).await?;
         self.client_fd.flush().await?;

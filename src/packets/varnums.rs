@@ -4,6 +4,7 @@ pub static VARNUM_ERROR: i32 = 0xFFFFFF;
 
 use super::PacketHandler;
 use log::*;
+use tokio::io;
 use tokio::net::TcpStream;
 
 impl<'a> PacketHandler<'a> {
@@ -33,8 +34,8 @@ impl<'a> PacketHandler<'a> {
         return value;
     }
 
-    pub fn size_varint(&self, mut value: i32) -> i32 {
-        let mut size: i32 = 1;
+    pub fn size_varint(&self, mut value: i32) -> u32 {
+        let mut size: u32 = 1;
         while (value & !SEGMENT_BITS) != 0 {
             value >>= 7;
             size += 1;
@@ -42,21 +43,18 @@ impl<'a> PacketHandler<'a> {
         return size;
     }
 
-    pub async fn write_varint(&mut self, mut value: i32) {
+    pub async fn write_varint(&mut self, mut value: i32) -> io::Result<()> {
         loop {
             if (value & !SEGMENT_BITS) == 0 {
-                let _ = self.write_byte(value as u8).await;
-                return;
+                self.write_byte(value as u8).await?;
+                break;
             }
 
-            if let Err(e) = self
-                .write_byte(((value & SEGMENT_BITS) | CONTINUE_BIT) as u8)
-                .await
-            {
-                error! {"{:?}", e};
-            }
+            self.write_byte(((value & SEGMENT_BITS) | CONTINUE_BIT) as u8)
+                .await?;
 
             value >>= 7;
         }
+        Ok(())
     }
 }
