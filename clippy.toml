@@ -1,0 +1,3 @@
+
+[workspace.lints.clippy]
+pedantic = "allow"

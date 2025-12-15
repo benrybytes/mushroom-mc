@@ -1,23 +1,24 @@
-use log::{error, info, warn};
+use log::{info, warn};
 mod globals;
 mod handlers;
 mod packets;
+mod types;
 use handlers::handle_client;
 use tokio::io;
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
     env_logger::init();
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:25565").await?;
+    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:25565").await?;
 
     info! {"starting minecraft server"};
     loop {
-        match listener.accept().await {
+        match tcp_listener.accept().await {
             Ok((mut socket, _)) => {
-                info! {"{:?}", socket};
+                info! {"{socket:?}"};
                 tokio::spawn(async move { handle_client(&mut socket).await });
             }
-            Err(e) => warn!("couldn't get client: {:?}", e),
+            Err(e) => warn!("couldn't get client: {e:?}"),
         }
     }
 }

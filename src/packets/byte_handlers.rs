@@ -1,70 +1,89 @@
 #![allow(static_mut_refs)]
 
 use super::PacketHandler;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use lazy_static::lazy_static;
+use crate::globals::{INVALID_READ, VARNUM_ERROR};
 use log::*;
-use std::io::{Cursor, Error, Write};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{io, net::TcpStream};
+use paste::paste;
+use std::{io::Error, mem};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 #[allow(non_camel_case_types)]
 #[derive(PartialEq, Eq)]
-pub enum RECV_TYPE {
-    READ,
-    PEEK,
+pub enum RecvType {
+    Read,
+    Peek,
 }
 
+macro_rules! read_bytes {
+    ($recv_prefixes:expr, $recv_type:expr, [$($type:ty),*]) => {
+        paste! {
+            #[allow(unused)]
+            impl<'a> PacketHandler<'a> {
+                $(
+                    pub async fn [<$recv_prefixes _ $type>](&mut self) -> Result<$type, i32> {
+                        const N_BYTES: usize = mem::size_of::<$type>();
+        self.recv_count = N_BYTES;
+                        info!("n bytes: {}", N_BYTES);
+                        if let Err(e) = self.recv_n_bytes(N_BYTES, $recv_type).await {
+        error!("ERROR RECEIVING BYTES :c {:?}", e);
+                        return Err(VARNUM_ERROR);
+        }
+        info!("fjoifjwe: {:?}", &self.recv_buffer[0..16]);
+        let mut buffer_temp = [0u8; N_BYTES];
+        buffer_temp.clone_from_slice(&self.recv_buffer[..N_BYTES]);
+                        let mut bytes_read: $type = $type::from_le_bytes(buffer_temp);
+
+        info!("BYTES: {}", bytes_read);
+                        Ok(bytes_read)
+                    }
+                )*
+            }
+        }
+    };
+}
+
+read_bytes!("read", RecvType::Read, [u8, u16, u32, u64]);
+read_bytes!("peek", RecvType::Peek, [u8, u16, u32, u64]);
+
 impl<'a> PacketHandler<'a> {
-    pub async fn read_string(&mut self) -> String {
-        let length = self.read_varint().await;
-        self.recv_n_bytes(length as usize, RECV_TYPE::READ).await;
-        self.recv_buffer[self.recv_count] = b'\0';
-
-        String::from_utf8_lossy(&self.recv_buffer[..self.recv_count]).to_string()
+    pub async fn read_uuid(&mut self) -> Result<[u8; 16], Error> {
+        self.recv_n_bytes(16, RecvType::Read).await?;
+        let mut uuid = [0u8; 16];
+        uuid.clone_from_slice(&self.recv_buffer[..16]);
+        Ok(uuid)
+    }
+    pub async fn read_string(&mut self) -> Result<String, i32> {
+        if let Ok(length) = self.read_varint().await {
+            debug!("LENGTH: {length}");
+            if let Ok(_) = self.recv_n_bytes(length as usize, RecvType::Read).await {
+                debug!("got string");
+                self.recv_buffer[self.recv_count] = b'\0';
+                self.recv_count += 1;
+                Ok(String::from_utf8_lossy(&self.recv_buffer[..self.recv_count]).to_string())
+            } else {
+                Err(INVALID_READ)
+            }
+        } else {
+            error!("invalid string reaed");
+            Err(INVALID_READ)
+        }
     }
 
-    pub async fn read_uint16(&mut self) -> u16 {
-        self.recv_n_bytes(2, RECV_TYPE::READ).await;
-        ((self.recv_buffer[0] as u16) << 8) | self.recv_buffer[1] as u16
-    }
-
-    pub async fn read_uint64(&mut self) -> u16 {
-        self.recv_n_bytes(8, RECV_TYPE::READ).await;
-        debug! {"{:?}", &self.recv_buffer[..10]};
-        ((self.recv_buffer[0] as u16) << 56)
-            | ((self.recv_buffer[1] as u16) << 48)
-            | ((self.recv_buffer[2] as u16) << 40)
-            | ((self.recv_buffer[3] as u16) << 32)
-            | ((self.recv_buffer[4] as u16) << 24)
-            | ((self.recv_buffer[5] as u16) << 16)
-            | ((self.recv_buffer[6] as u16) << 8)
-            | self.recv_buffer[7] as u16
-    }
-
-    pub async fn recv_n_bytes(&mut self, n: usize, recv_type: RECV_TYPE) {
+    /// this method reads n bytes from client
+    pub async fn recv_n_bytes(&mut self, n: usize, recv_type: RecvType) -> Result<usize, Error> {
         match recv_type {
-            RECV_TYPE::READ => {
+            RecvType::Read => {
                 self.recv_count = self
                     .client_fd
                     .read_exact(&mut self.recv_buffer[..n])
-                    .await
-                    .expect("could not read");
+                    .await?;
                 self.processed_bytes += self.recv_count;
             }
-            RECV_TYPE::PEEK => {
-                self.recv_count = self
-                    .client_fd
-                    .peek(&mut self.recv_buffer[..n])
-                    .await
-                    .expect("could not peek");
+            RecvType::Peek => {
+                self.recv_count = self.client_fd.peek(&mut self.recv_buffer[..n]).await?;
             }
         };
-    }
-
-    pub async fn read_byte(&mut self) -> io::Result<u8> {
-        self.recv_count = self.client_fd.read(&mut self.recv_buffer[..1]).await?;
-        Ok(self.recv_buffer[0])
+        Ok(self.recv_count)
     }
 
     pub async fn write_utf8_string(&mut self, data: &[u8]) -> io::Result<()> {
