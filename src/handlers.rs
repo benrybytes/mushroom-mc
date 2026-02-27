@@ -3,7 +3,6 @@ use lazy_static::lazy_static;
 use log::*;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio::{io, net::TcpStream};
 
@@ -28,9 +27,7 @@ async fn packet_handle<'a>(packet_handler: &mut PacketHandler<'a>, packet_id: i3
     }
     packet_handler.recv_count = 0;
     packet_handler.processed_bytes = 0;
-    if let Err(e) = packet_handler.client_fd.flush().await {
-        error!("could not flush: {e}");
-    }
+    packet_handler.disconnect_client().await;
 }
 
 pub async fn handle_client(client_fd: &mut TcpStream) -> Result<(), io::Error> {
@@ -59,12 +56,8 @@ pub async fn handle_client(client_fd: &mut TcpStream) -> Result<(), io::Error> {
             packet_handler.length = remaining_packet_length as usize;
             packet_handle(&mut packet_handler, packet_id).await;
         } else {
-            // disconnectClient(&clients[client_index], 2);
+            packet_handler.disconnect_client().await;
             continue;
         }
     }
-}
-
-fn _disconnect_client() {
-    todo! {}
 }

@@ -1,11 +1,13 @@
 use log::*;
 use std::os::fd::AsRawFd;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 pub mod byte_handlers;
 pub mod varnums;
 use crate::globals::*;
 use crate::handlers::PLAYER_STATES;
+use crate::types::*;
 
 static DEFAULT_SIZE: usize = 1024;
 
@@ -35,34 +37,46 @@ impl<'a> PacketHandler<'a> {
             processed_bytes: 0,
         }
     }
+
+    pub async fn disconnect_client(&mut self) {
+        if let Err(e) = self.client_fd.flush().await
+            && let None = PLAYER_STATES
+                .write()
+                .await
+                .remove(&self.client_fd.as_raw_fd())
+        {
+            error!("invalid cleaning up client \nreason{e}");
+        }
+    }
+
     pub async fn handshake(&mut self) {
         let state = self.client_state;
         debug! {"state received {}", state};
-        if state == STATE_NONE {
-            debug! {"in state none"};
-            if self.cs_handshake().await == RecvStatus::ERROR {
-                warn! {"cs_handshake unsuccessful"};
-                return;
-            }
-        } else if state == STATE_STATUS {
-            info! { "sending status" };
-            if self.sc_status_response().await == RecvStatus::ERROR {
-                warn! {"sc_statusResponse unsuccessful"};
-                return;
-            }
+        if state == STATE_NONE
+            && let Err(error_message) = self.cs_handshake().await
+        {
+            error! {"{error_message}"};
+            self.disconnect_client().await;
+            return;
+        } else if state == STATE_STATUS
+            && let Err(error_message) = self.sc_status_response().await
+        {
+            error! {"{error_message}"};
+            self.disconnect_client().await;
         }
 
-        if state == STATE_LOGIN {
-            let (name, uuid) = self.cs_login_start().await.expect("could not get");
-
-            let _ = self.sc_login_success(name, &uuid).await.unwrap();
-        } else if state == STATE_CONFIGURATION {
+        if state == STATE_LOGIN
+            && let Ok((name, uuid)) = self.cs_login_start().await
+            && let Ok(()) = self.sc_login_success(name, &uuid).await
+        {
+        } else if state == STATE_CONFIGURATION &&
+            let Ok(_) = self.cs_client_information().await &&
             //     if cs_clientInformation(client_fd) || sc_knownPacks(client_fd) || sc_registries(client_fd) {
             //         return;
-            self.sc_send_plugin_message("minecraft:brand", BRAND).await;
+            let Err(error_message) = self.sc_send_plugin_message("minecraft:brand", BRAND).await
+        {
+            error! {"{error_message}"};
         }
-
-        if state == STATE_LOGIN {}
     }
 
     /// sends ping to client
@@ -80,7 +94,7 @@ impl<'a> PacketHandler<'a> {
         }
     }
 
-    pub async fn cs_handshake(&mut self) -> RecvStatus {
+    pub async fn cs_handshake(&mut self) -> Result<(), &str> {
         debug!("RECV COUNT: {}", self.recv_count);
         let mut client_states_ = PLAYER_STATES.write().await;
         if let None = client_states_.get(&self.client_fd.as_raw_fd())
@@ -98,14 +112,13 @@ impl<'a> PacketHandler<'a> {
                 client_states_.insert(self.client_fd.as_raw_fd(), intent);
                 self.client_state = intent;
             }
-            RecvStatus::SUCCESS
+            Ok(())
         } else {
-            error!("user disconnected or invalid read for cs_handshake");
-            RecvStatus::ERROR
+            Err("user disconnected or invalid read for cs_handshake")
         }
     }
 
-    pub async fn sc_send_plugin_message(&mut self, channel: &str, data: &str) -> RecvStatus {
+    pub async fn sc_send_plugin_message(&mut self, channel: &str, data: &str) -> Result<(), &str> {
         let channel_len = channel.len() as i32;
         let data_len = data.len() as i32;
 
@@ -123,56 +136,55 @@ impl<'a> PacketHandler<'a> {
 
         let _ = self.write_n_bytes(data.as_bytes(), data_len as usize);
 
-        RecvStatus::SUCCESS
+        Ok(())
     }
-    async fn sc_status_response(&mut self) -> RecvStatus {
+
+    async fn sc_status_response(&mut self) -> Result<(), &str> {
         // 1. Prepare the JSON data (DO NOT REVERSE)
-        let response_json = br###"
-        {
-            "version": {
-                "name": "1.21.11",
-                "protocol": 774
+        let response_json = StatusResponse {
+            version: Version {
+                name: String::from("1.21.11"),
+                protocol: 774,
             },
-            "description": {
-                "text": "{BRAND}"
+            description: Description {
+                text: String::from("blahaj minecraft server"),
             },
-            "favicon": "../../world/icon.png",
-            "players": {
-                "max": 20,
-                "online": 0
+            favicon: Some(String::from("null data for now")),
+            players: Players {
+                max: 20,
+                online: 0,
+                sample: vec![],
             },
-            "enforcesSecureChat": false
+            enforces_secure_chat: false,
+            preview_chats: true,
+        };
+
+        if let Ok(response_json) = serde_json::to_string(&response_json) {
+            // The data for the String field (Length VarInt + JSON Data)
+            let string_data_len = response_json.len() as i32;
+            let string_field_size = Self::size_varint(string_data_len) + string_data_len as u32;
+
+            // The total length of the Packet ID (0x00) + String Field
+            // Packet ID is 0x00, which takes 1 byte as a VarInt.
+            let packet_data_length = 1 + string_field_size;
+
+            // 2. Write the overall Packet Length prefix (as a VarInt)
+            if let Err(_) = self.write_varint(packet_data_length as i32).await &&
+            // 3. Write the Packet ID (0x00 as a VarInt)
+            let Err(_) = self.write_varint(0x00).await &&
+
+            // 4. Write the String (which handles its own length prefix)
+
+            let Err(_) = self.write_utf8_string(&response_json.into_bytes()).await
+            {
+                error!("could not send status response")
+            }
+
+            info! {"SC Status Response sent successfully"};
+            Ok(())
+        } else {
+            Err("could not check successfully logging in")
         }
-        "###;
-
-        // The data for the String field (Length VarInt + JSON Data)
-        let string_data_len = response_json.len() as i32;
-        let string_field_size = Self::size_varint(string_data_len) + string_data_len as u32;
-
-        // The total length of the Packet ID (0x00) + String Field
-        // Packet ID is 0x00, which takes 1 byte as a VarInt.
-        let packet_data_length = 1 + string_field_size;
-
-        // 2. Write the overall Packet Length prefix (as a VarInt)
-        if let Err(e) = self.write_varint(packet_data_length as i32).await {
-            error! {"could not write packet length {:?}", e};
-            return RecvStatus::ERROR;
-        }
-
-        // 3. Write the Packet ID (0x00 as a VarInt)
-        if let Err(e) = self.write_varint(0x00).await {
-            error! {"could not write packet ID {:?}", e};
-            return RecvStatus::ERROR;
-        }
-
-        // 4. Write the String (which handles its own length prefix)
-        if let Err(e) = self.write_utf8_string(response_json).await {
-            error! {"could not write status JSON string {:?}", e};
-            return RecvStatus::ERROR;
-        }
-
-        info! {"SC Status Response sent successfully"};
-        RecvStatus::SUCCESS
     }
     // C->S Login Start
     async fn cs_login_start(&mut self) -> Result<(String, [u8; 16]), &str> {
@@ -195,6 +207,7 @@ impl<'a> PacketHandler<'a> {
         debug!("Sending Login Success...\n\n");
         // sc_login_success
         if let Ok(_) = self
+            // send length of length, uuid, and name together
             .write_varint(
                 (1 + 16 + Self::size_varint(name.len() as i32) + name.len() as u32 + 1) as i32,
             )
@@ -210,6 +223,34 @@ impl<'a> PacketHandler<'a> {
             Ok(())
         } else {
             Err("error logging in successfully")
+        }
+    }
+
+    async fn sc_known_packs(&mut self) -> Result<(), &str> {}
+
+    async fn cs_client_information(&mut self) -> Result<(), &str> {
+        if let Ok(locale) = self.read_string().await
+            && let Ok(view_distance) = self.read_u8().await
+            && let Ok(chat_mode) = self.read_varint().await
+            && let Ok(chat_color) = self.read_u8().await
+
+        // capes and other stuff about skin
+            && let Ok(displayed_skin_parts) = self.read_u8().await
+            && let Ok(main_hand) = self.read_varint().await
+            && let Ok(text_filter) = self.read_u8().await
+            && let Ok(server_listing) = self.read_u8().await
+            && let Ok(particle_status) = self.read_varint().await
+        {
+            info!(
+                "{locale}
+                {view_distance}
+                {chat_mode}
+                {particle_status}
+            "
+            );
+            Ok(())
+        } else {
+            Err("issue getting client information")
         }
     }
 }
